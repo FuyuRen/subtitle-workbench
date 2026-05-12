@@ -1,0 +1,21 @@
+# Fill in API settings before running network tasks.
+whisper_base_url=https://api.openai.com/v1/audio/transcriptions
+whisper_api_key=
+whisper_model=whisper-1
+llm_base_url=https://api.openai.com/v1/chat/completions
+llm_api_key=
+llm_model=gpt-4o-mini
+retry_count=0
+source_lang=en
+target_lang=zh
+output_dir=
+bilingual_subtitles=0
+hard_subtitle_font=Microsoft YaHei
+hard_subtitle_font_size_zh=28
+hard_subtitle_font_size_en=20
+hard_subtitle_bottom_margin=60
+hard_subtitle_fill_color=255,255,255,255
+hard_subtitle_outline_color=0,0,0,255
+hard_subtitle_outline_thickness=2
+hard_subtitle_bilingual_gap=12
+hard_subtitle_preview_background_color=22,24,28,255

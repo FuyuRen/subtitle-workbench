@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-package:
+    name: Build, test and publish
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure debug
+        run: cmake --preset msvc-debug
+
+      - name: Build debug
+        run: cmake --build --preset debug
+
+      - name: Test debug
+        run: ctest --preset debug --output-on-failure
+
+      - name: Configure release
+        run: cmake --preset msvc-release -DSWB_BUILD_TESTS=OFF -DSWB_BUNDLE_EXTERNAL_TOOLS=OFF
+
+      - name: Build release
+        run: cmake --build --preset release
+
+      - name: Package release
+        run: |
+          cpack --config build/release/CPackConfig.cmake -G ZIP -B build/release/dist
+          if (-not (Test-Path "build/release/dist/subtitle-workbench-release-windows-x64.zip")) {
+              throw "Package was not generated."
+          }
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tagName = $env:GITHUB_REF_NAME
+          $packagePath = Resolve-Path "build/release/dist/subtitle-workbench-release-windows-x64.zip"
+          gh release view $tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tagName $packagePath --clobber
+          } else {
+            gh release create $tagName $packagePath --title $tagName --generate-notes
+          }

@@ -1,0 +1,27 @@
+build/
+.vs/
+.vscode/
+scripts/
+
+# Local build and IDE settings
+CMakeUserPresets.json
+*.user
+NOTES.md
+
+# Local runtime configuration
+/config.ini
+/config.local.ini
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Local release artifacts
+/subtitle-workbench-release-*.zip
+
+# Local UI state and OS noise
+/imgui.ini
+Thumbs.db
+Desktop.ini
