@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace swb {
 
@@ -117,6 +118,105 @@ namespace {
         + std::to_string(static_cast<int>(color.alpha));
 }
 
+[[nodiscard]] std::optional<TranscriptionBackend> parse_transcription_backend(std::string_view value) {
+    const std::string lowered = lower_ascii(trim_ascii_whitespace(value));
+    if (lowered == "local") {
+        return TranscriptionBackend::local;
+    }
+    if (lowered == "api") {
+        return TranscriptionBackend::api;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<LocalAsrCompute> parse_local_asr_compute(std::string_view value) {
+    const std::string lowered = lower_ascii(trim_ascii_whitespace(value));
+    if (lowered == "auto") {
+        return LocalAsrCompute::automatic;
+    }
+    if (lowered == "gpu") {
+        return LocalAsrCompute::gpu;
+    }
+    if (lowered == "cpu") {
+        return LocalAsrCompute::cpu;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] bool has_explicit_legacy_api_configuration(
+    const std::unordered_map<std::string, std::string>& key_values) {
+    const auto value_or_empty = [&](std::string_view key) -> std::string_view {
+        const auto iterator = key_values.find(std::string{key});
+        return iterator == key_values.end() ? std::string_view{} : trim_ascii_whitespace(iterator->second);
+    };
+
+    constexpr std::string_view example_endpoint = "https://api.openai.com/v1/audio/transcriptions";
+    const std::string_view base_url = value_or_empty("whisper_base_url");
+    const std::string_view api_key = value_or_empty("whisper_api_key");
+    const std::string_view model = value_or_empty("whisper_model");
+    return !api_key.empty()
+        || (!base_url.empty() && base_url != example_endpoint)
+        || (!model.empty() && model != "whisper-1");
+}
+
+[[nodiscard]] bool is_known_key(std::string_view key) {
+    static const std::unordered_set<std::string> known_keys{
+        "transcription_backend",
+        "local_asr_model",
+        "local_asr_model_dir",
+        "local_asr_compute",
+        "local_asr_gpu_device",
+        "local_asr_threads",
+        "local_asr_use_vad",
+        "whisper_base_url",
+        "whisper_api_key",
+        "whisper_model",
+        "llm_base_url",
+        "language_model_base_url",
+        "llm_api_key",
+        "language_model_api_key",
+        "llm_model",
+        "language_model_name",
+        "retry_count",
+        "source_lang",
+        "target_lang",
+        "output_dir",
+        "bilingual_subtitles",
+        "hard_subtitle_font",
+        "hard_subtitle_font_size_zh",
+        "hard_subtitle_font_size_en",
+        "hard_subtitle_bottom_margin",
+        "hard_subtitle_fill_color",
+        "hard_subtitle_outline_color",
+        "hard_subtitle_outline_thickness",
+        "hard_subtitle_bilingual_gap",
+        "hard_subtitle_preview_background_color",
+    };
+    return known_keys.contains(std::string{key});
+}
+
+}
+
+std::string_view transcription_backend_name(TranscriptionBackend backend) noexcept {
+    switch (backend) {
+    case TranscriptionBackend::local:
+        return "local";
+    case TranscriptionBackend::api:
+        return "api";
+    }
+    return "local";
+}
+
+std::string_view local_asr_compute_name(LocalAsrCompute compute) noexcept {
+    switch (compute) {
+    case LocalAsrCompute::automatic:
+        return "auto";
+    case LocalAsrCompute::gpu:
+        return "gpu";
+    case LocalAsrCompute::cpu:
+        return "cpu";
+    }
+    return "auto";
 }
 
 std::filesystem::path default_config_path() {
@@ -144,6 +244,9 @@ Config load_config(const std::filesystem::path& path) {
         const std::string_view key = trim_ascii_whitespace(view.substr(0, separator_position));
         const std::string_view value = trim_ascii_whitespace(view.substr(separator_position + 1));
         key_values[std::string{key}] = std::string{value};
+        if (!is_known_key(key)) {
+            configuration.preserved_fields.emplace_back(key, value);
+        }
     }
 
     const auto assign_if_present = [&](std::string_view key, std::string& value) {
@@ -162,6 +265,33 @@ Config load_config(const std::filesystem::path& path) {
         }
     };
 
+    if (const auto backend_it = key_values.find("transcription_backend"); backend_it != key_values.end()) {
+        if (const std::optional<TranscriptionBackend> backend = parse_transcription_backend(backend_it->second); backend.has_value()) {
+            configuration.transcription_backend = *backend;
+        }
+    } else if (has_explicit_legacy_api_configuration(key_values)) {
+        configuration.transcription_backend = TranscriptionBackend::api;
+    }
+    assign_if_present("local_asr_model", configuration.local_asr_model);
+    assign_if_present("local_asr_model_dir", configuration.local_asr_model_dir);
+    if (const auto compute_it = key_values.find("local_asr_compute"); compute_it != key_values.end()) {
+        if (const std::optional<LocalAsrCompute> compute = parse_local_asr_compute(compute_it->second); compute.has_value()) {
+            configuration.local_asr_compute = *compute;
+        }
+    }
+    if (const auto device_it = key_values.find("local_asr_gpu_device"); device_it != key_values.end()) {
+        if (const std::optional<int> device = parse_int(device_it->second); device.has_value() && *device >= 0) {
+            configuration.local_asr_gpu_device = *device;
+        }
+    }
+    if (const auto threads_it = key_values.find("local_asr_threads"); threads_it != key_values.end()) {
+        if (const std::optional<int> threads = parse_int(threads_it->second); threads.has_value() && *threads >= 0) {
+            configuration.local_asr_threads = *threads;
+        }
+    }
+    if (const auto use_vad_it = key_values.find("local_asr_use_vad"); use_vad_it != key_values.end()) {
+        configuration.local_asr_use_vad = parse_bool(use_vad_it->second);
+    }
     assign_if_present("whisper_base_url", configuration.whisper_base_url);
     assign_if_present("whisper_api_key", configuration.whisper_api_key);
     assign_if_present("whisper_model", configuration.whisper_model);
@@ -234,7 +364,14 @@ void save_config(const Config& configuration, const std::filesystem::path& path)
         return;
     }
 
-    output << "whisper_base_url=" << configuration.whisper_base_url << '\n'
+    output << "transcription_backend=" << transcription_backend_name(configuration.transcription_backend) << '\n'
+           << "local_asr_model=" << configuration.local_asr_model << '\n'
+           << "local_asr_model_dir=" << configuration.local_asr_model_dir << '\n'
+           << "local_asr_compute=" << local_asr_compute_name(configuration.local_asr_compute) << '\n'
+           << "local_asr_gpu_device=" << std::max(configuration.local_asr_gpu_device, 0) << '\n'
+           << "local_asr_threads=" << std::max(configuration.local_asr_threads, 0) << '\n'
+           << "local_asr_use_vad=" << (configuration.local_asr_use_vad ? "1" : "0") << '\n'
+           << "whisper_base_url=" << configuration.whisper_base_url << '\n'
            << "whisper_api_key=" << configuration.whisper_api_key << '\n'
            << "whisper_model=" << configuration.whisper_model << '\n'
            << "llm_base_url=" << configuration.language_model_base_url << '\n'
@@ -254,6 +391,11 @@ void save_config(const Config& configuration, const std::filesystem::path& path)
             << "hard_subtitle_outline_thickness=" << configuration.hard_subtitle_style.outline_thickness << '\n'
             << "hard_subtitle_bilingual_gap=" << configuration.hard_subtitle_style.bilingual_line_gap << '\n'
             << "hard_subtitle_preview_background_color=" << serialize_color(configuration.hard_subtitle_style.preview_background_color) << '\n';
+    for (const auto& [key, value] : configuration.preserved_fields) {
+        if (!key.empty() && !is_known_key(key)) {
+            output << key << '=' << value << '\n';
+        }
+    }
 }
 
 }

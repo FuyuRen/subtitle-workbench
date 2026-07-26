@@ -28,7 +28,7 @@ const swb::test::Registrar case_1{
 
         std::optional<swb::http::Request> captured_request;
         std::vector<std::string> progress_updates;
-        const swb::WhisperTranscriber transcriber{
+        const swb::WhisperApiTranscriber transcriber{
             [&](const swb::http::Request& request) {
                 captured_request = request;
                 return swb::http::Response{
@@ -89,7 +89,7 @@ const swb::test::Registrar case_2{
         }
 
         std::optional<swb::http::Request> captured_request;
-        const swb::WhisperTranscriber transcriber{
+        const swb::WhisperApiTranscriber transcriber{
             [&](const swb::http::Request& request) {
                 captured_request = request;
                 return swb::http::Response{
@@ -126,7 +126,7 @@ const swb::test::Registrar case_3{
         }
 
         bool sender_called = false;
-        const swb::WhisperTranscriber transcriber{
+        const swb::WhisperApiTranscriber transcriber{
             [&](const swb::http::Request&) {
                 sender_called = true;
                 return swb::http::Response{};
@@ -153,7 +153,7 @@ const swb::test::Registrar case_4{
             output << "RIFFtest-data";
         }
 
-        const swb::WhisperTranscriber transcriber{
+        const swb::WhisperApiTranscriber transcriber{
             [&](const swb::http::Request&) {
                 return swb::http::Response{
                     .status = 500,

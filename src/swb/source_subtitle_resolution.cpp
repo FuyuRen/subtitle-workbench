@@ -82,13 +82,13 @@ constexpr std::string_view translated_subtitle_file_name = "zh.srt";
 
 SourceSubtitleSelection select_source_subtitle(
     bool has_platform_manual_subtitle,
-    bool has_api_transcription,
+    bool has_transcription,
     bool has_platform_automatic_subtitle) noexcept {
     if (has_platform_manual_subtitle) {
         return SourceSubtitleSelection::platform_manual_subtitle;
     }
-    if (has_api_transcription) {
-        return SourceSubtitleSelection::api_transcription;
+    if (has_transcription) {
+        return SourceSubtitleSelection::transcription;
     }
     if (has_platform_automatic_subtitle) {
         return SourceSubtitleSelection::platform_automatic_subtitle;

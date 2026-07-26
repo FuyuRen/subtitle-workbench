@@ -155,11 +155,11 @@ const swb::test::Registrar case_7{
 };
 
 const swb::test::Registrar case_8{
-    "task: source subtitle selection prefers manual then api then automatic",
+    "task: source subtitle selection prefers manual then transcription then automatic",
     [] {
         expect_eq(swb::select_source_subtitle(true, false, false), swb::SourceSubtitleSelection::platform_manual_subtitle);
         expect_eq(swb::select_source_subtitle(true, true, true), swb::SourceSubtitleSelection::platform_manual_subtitle);
-        expect_eq(swb::select_source_subtitle(false, true, true), swb::SourceSubtitleSelection::api_transcription);
+        expect_eq(swb::select_source_subtitle(false, true, true), swb::SourceSubtitleSelection::transcription);
         expect_eq(swb::select_source_subtitle(false, false, true), swb::SourceSubtitleSelection::platform_automatic_subtitle);
         expect_eq(swb::select_source_subtitle(false, false, false), swb::SourceSubtitleSelection::unavailable);
     },
@@ -268,7 +268,7 @@ const swb::test::Registrar case_13{
         const auto& fetch_step = snapshot[static_cast<std::size_t>(swb::StepId::fetch_source_subtitle)];
         const auto& translate_step = snapshot[static_cast<std::size_t>(swb::StepId::translate)];
         expect_true(fetch_step.state == swb::StepState::completed);
-        expect_eq(fetch_step.status, std::string{"API转写"});
+        expect_eq(fetch_step.status, std::string{"转写"});
         expect_true(translate_step.state == swb::StepState::completed);
         expect_eq(translate_step.status, std::string{"复用现有翻译"});
     },

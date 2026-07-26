@@ -8,7 +8,7 @@ namespace swb {
 enum class SourceSubtitleSelection : int {
     unavailable,
     platform_manual_subtitle,
-    api_transcription,
+    transcription,
     platform_automatic_subtitle,
 };
 
@@ -32,7 +32,7 @@ struct WorkingDirectoryState {
 
 [[nodiscard]] SourceSubtitleSelection select_source_subtitle(
     bool has_platform_manual_subtitle,
-    bool has_api_transcription,
+    bool has_transcription,
     bool has_platform_automatic_subtitle) noexcept;
 
 [[nodiscard]] WorkingDirectoryState inspect_working_directory_state(const std::filesystem::path& working_directory);

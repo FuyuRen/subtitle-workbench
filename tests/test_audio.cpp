@@ -84,4 +84,29 @@ const swb::test::Registrar case_1{
     },
 };
 
+const swb::test::Registrar case_2{
+    "audio: streams bounded overlapping wav windows",
+    [] {
+        const std::filesystem::path directory = make_audio_directory("stream-overlap");
+        const std::filesystem::path input_path = directory / "audio.wav";
+        write_binary_file(input_path, make_test_wav_bytes(65));
+
+        swb::WavWindowReader reader{input_path};
+        expect_true(reader.valid());
+        expect_true(reader.duration_seconds() == 65.0);
+
+        const auto first = reader.read_next(30, 2);
+        const auto second = reader.read_next(30, 2);
+        const auto third = reader.read_next(30, 2);
+        const auto end = reader.read_next(30, 2);
+        expect_true(first.has_value() && second.has_value() && third.has_value());
+        expect_true(!end.has_value());
+        expect_true(first->start_seconds == 0.0);
+        expect_true(second->start_seconds == 28.0);
+        expect_true(third->start_seconds == 56.0);
+        expect_eq(first->samples.size(), std::size_t{30 * 16000});
+        expect_eq(third->samples.size(), std::size_t{9 * 16000});
+    },
+};
+
 }

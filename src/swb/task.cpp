@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <system_error>
 #include <utility>
@@ -33,9 +34,6 @@ constexpr std::string_view source_subtitle_filename = "en.srt";
 constexpr std::string_view manual_subtitle_filename = "manual.en.srt";
 constexpr std::string_view automatic_subtitle_filename = "auto.en.srt";
 constexpr std::string_view translated_subtitle_filename = "zh.srt";
-constexpr std::string_view transcription_chunk_directory = "transcribe-chunks";
-constexpr std::string_view chunk_transcript_filename = "transcript.json";
-constexpr int transcription_chunk_seconds = 300;
 constexpr int retry_delay_ms = 600;
 constexpr std::uint64_t task_progress_scale = 1000;
 
@@ -70,28 +68,6 @@ constexpr std::uint64_t task_progress_scale = 1000;
     return clamp_progress(static_cast<double>(progress.downloaded_bytes) / static_cast<double>(progress.total_bytes));
 }
 
-[[nodiscard]] double transcription_stage_fraction(TranscriptionStage stage) noexcept {
-    switch (stage) {
-    case TranscriptionStage::reading_audio:
-        return 0.15;
-    case TranscriptionStage::preparing_request:
-        return 0.35;
-    case TranscriptionStage::requesting:
-        return 0.8;
-    case TranscriptionStage::writing_result:
-        return 0.92;
-    }
-    return 0.0;
-}
-
-[[nodiscard]] double fetch_step_transcription_progress(TranscriptionStage stage) noexcept {
-    return 0.25 + transcription_stage_fraction(stage) * 0.7;
-}
-
-[[nodiscard]] double fetch_step_batch_progress(std::size_t position, std::size_t count) noexcept {
-    return 0.25 + fraction_from_count(position, count) * 0.65;
-}
-
 [[nodiscard]] double translate_step_progress(std::size_t position, std::size_t count) noexcept {
     return fraction_from_count(position, count);
 }
@@ -108,12 +84,6 @@ constexpr std::uint64_t task_progress_scale = 1000;
     formatted.append(std::to_string(retry_count));
     formatted.append("）");
     return formatted;
-}
-
-[[nodiscard]] std::filesystem::path transcription_chunk_result_directory(
-    const std::filesystem::path& chunk_root,
-    const std::filesystem::path& chunk_path) {
-    return chunk_root / chunk_path.stem();
 }
 
 [[nodiscard]] bool copy_file_replace(const std::filesystem::path& source, const std::filesystem::path& destination) {
@@ -185,7 +155,8 @@ struct Task::ExecutionContext {
     YtDlp yt_dlp{YtDlp::resolve_executable()};
     Ffmpeg audio_converter{Ffmpeg::resolve_executable()};
     SubtitleOutputRenderer output_renderer{audio_converter.executable()};
-    WhisperTranscriber transcriber{};
+    WhisperApiTranscriber api_transcriber{};
+    std::unique_ptr<WhisperCppTranscriber> local_transcriber;
     SubtitleTranslator translator{};
     std::filesystem::path video_path;
     bool is_remote_source{false};
@@ -193,7 +164,7 @@ struct Task::ExecutionContext {
     std::string source_key;
     WorkingDirectoryState working_directory_state;
     bool has_platform_manual_subtitle{false};
-    bool has_api_transcription{false};
+    bool has_transcription{false};
     bool has_platform_automatic_subtitle{false};
     std::string subtitle_status;
     std::string fetch_failure_status{"无可用字幕"};
@@ -219,6 +190,7 @@ void Task::start(std::string source, Config configuration, TaskStartOptions opti
     {
         std::scoped_lock lock(mutex_);
         detected_title_.clear();
+        transcription_runtime_ = {};
     }
     working_directory_.clear();
     cancel_.store(false, std::memory_order_release);
@@ -245,6 +217,16 @@ std::filesystem::path Task::working_directory() const {
     return working_directory_;
 }
 
+TranscriptionRuntime Task::transcription_runtime() const {
+    std::scoped_lock lock(mutex_);
+    return transcription_runtime_;
+}
+
+void Task::set_transcription_runtime(TranscriptionRuntime runtime) {
+    std::scoped_lock lock(mutex_);
+    transcription_runtime_ = std::move(runtime);
+}
+
 void Task::reset_steps() {
     std::scoped_lock lock(mutex_);
     for (StepInfo& step_info : steps_) {
@@ -257,10 +239,14 @@ void Task::reset_steps() {
 void Task::set_step(StepId step, StepState state, std::string status, std::optional<double> progress) {
     std::scoped_lock lock(mutex_);
     StepInfo& step_info = steps_[static_cast<std::size_t>(step)];
+    const StepState previous_state = step_info.state;
     step_info.state = state;
     step_info.status = std::move(status);
     if (progress.has_value()) {
-        step_info.progress = clamp_progress(*progress);
+        const double next_progress = clamp_progress(*progress);
+        step_info.progress = state == StepState::in_progress && previous_state == StepState::in_progress
+            ? std::max(step_info.progress, next_progress)
+            : next_progress;
         return;
     }
     switch (state) {
@@ -485,6 +471,12 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
         return cancel_step(StepId::fetch_source_subtitle);
     }
 
+    context.has_platform_manual_subtitle = false;
+    context.has_transcription = false;
+    context.has_platform_automatic_subtitle = false;
+    context.subtitle_status.clear();
+    context.fetch_failure_status = "无可用字幕";
+
     if (context.working_directory_state.manual_subtitle_path.has_value()) {
         if (!promote_existing_subtitle(context, *context.working_directory_state.manual_subtitle_path)) {
             return fail_source_pipeline("无法写入en.srt", "无可用字幕");
@@ -492,14 +484,14 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
         context.has_platform_manual_subtitle = true;
         context.subtitle_status = "平台人工字幕";
     } else if (context.working_directory_state.transcript_path.has_value() && context.working_directory_state.source_subtitle_path.has_value()) {
-        context.has_api_transcription = true;
-        context.subtitle_status = "API转写";
+        context.has_transcription = true;
+        context.subtitle_status = "转写";
     } else if (context.working_directory_state.source_subtitle_path.has_value() && !context.working_directory_state.automatic_subtitle_path.has_value()) {
         context.has_platform_manual_subtitle = true;
         context.subtitle_status = "复用现有字幕";
     }
 
-    if (!context.has_platform_manual_subtitle && !context.has_api_transcription && context.is_remote_source) {
+    if (!context.has_platform_manual_subtitle && !context.has_transcription && context.is_remote_source) {
         set_step(StepId::fetch_source_subtitle, StepState::in_progress, "查询平台人工字幕", 0.05);
         if (const std::optional<SubtitleDownload> subtitle = context.yt_dlp.download_subtitle(
                 source_,
@@ -514,7 +506,7 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
             context.has_platform_manual_subtitle = true;
             context.subtitle_status = "平台人工字幕";
         } else if (!is_canceled()) {
-                set_step(StepId::fetch_source_subtitle, StepState::in_progress, "查询平台自动字幕", 0.1);
+            set_step(StepId::fetch_source_subtitle, StepState::in_progress, "查询平台自动字幕", 0.1);
             if (const std::optional<SubtitleDownload> subtitle = context.yt_dlp.download_subtitle(
                     source_,
                     configuration_.source_lang,
@@ -527,7 +519,7 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
         }
     }
 
-    if (!context.has_platform_manual_subtitle && !context.has_api_transcription) {
+    if (!context.has_platform_manual_subtitle && !context.has_transcription) {
         refresh_working_directory_state(context);
         switch (classify_source_subtitle_resume_stage(context.working_directory_state)) {
         case SourceSubtitleResumeStage::ready_source_subtitle:
@@ -544,8 +536,8 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
             break;
         case SourceSubtitleResumeStage::needs_segmentation:
             if (build_source_subtitle_from_transcript(context)) {
-                context.has_api_transcription = true;
-                context.subtitle_status = "API转写";
+                context.has_transcription = true;
+                context.subtitle_status = "转写";
             } else {
                 context.fetch_failure_status = "transcript.json生成字幕失败";
             }
@@ -572,113 +564,67 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
                 refresh_working_directory_state(context);
             }
             if (!context.working_directory_state.transcript_path.has_value() && context.working_directory_state.audio_path.has_value()) {
-                const std::filesystem::path chunk_root = working_directory_ / std::string{transcription_chunk_directory};
-                const std::optional<std::vector<AudioChunk>> audio_chunks = split_wav_into_chunks(
-                    *context.working_directory_state.audio_path,
-                    chunk_root,
-                    transcription_chunk_seconds);
-                if (!audio_chunks.has_value()) {
-                    context.fetch_failure_status = "音频切片失败";
-                    break;
-                }
-
-                if (audio_chunks->size() == std::size_t{1}) {
+                const auto progress_callback = [this](std::string_view status, double progress) {
                     set_step(
                         StepId::fetch_source_subtitle,
                         StepState::in_progress,
-                        format_transcription_progress(TranscriptionStage::reading_audio),
-                        fetch_step_transcription_progress(TranscriptionStage::reading_audio));
-                    const TranscriptionOutcome transcription = context.transcriber.transcribe(
+                        std::string{status},
+                        0.25 + clamp_progress(progress) * 0.65);
+                };
+
+                TranscriptionResult transcription;
+                if (configuration_.transcription_backend == TranscriptionBackend::local) {
+                    if (!context.local_transcriber) {
+                        set_step(StepId::fetch_source_subtitle, StepState::in_progress, "加载本地语音模型", 0.25);
+                        context.local_transcriber = std::make_unique<WhisperCppTranscriber>(configuration_);
+                    }
+                    set_transcription_runtime(context.local_transcriber->runtime());
+                    if (!context.local_transcriber->ready()) {
+                        context.fetch_failure_status = std::string{context.local_transcriber->error()};
+                        break;
+                    }
+                    transcription = context.local_transcriber->transcribe_wav(
+                        configuration_,
+                        *context.working_directory_state.audio_path,
+                        configuration_.source_lang,
+                        cancel_,
+                        progress_callback);
+                } else {
+                    transcription = transcribe_wav_with_api(
+                        context.api_transcriber,
                         configuration_,
                         *context.working_directory_state.audio_path,
                         working_directory_,
                         configuration_.source_lang,
                         cancel_,
-                        [this](TranscriptionStage stage) {
-                            set_step(
-                                StepId::fetch_source_subtitle,
-                                StepState::in_progress,
-                                format_transcription_progress(stage),
-                                fetch_step_transcription_progress(stage));
-                        });
-                    if (!transcription.success) {
-                        if (transcription.message == "已取消") {
-                            return cancel_step(StepId::fetch_source_subtitle);
-                        }
-                        context.fetch_failure_status = transcription.message;
-                        break;
-                    }
-                    std::error_code cleanup_error;
-                    std::filesystem::remove_all(chunk_root, cleanup_error);
-                    refresh_working_directory_state(context);
-                } else {
-                    std::vector<TranscriptWord> merged_words;
-                    merged_words.reserve(audio_chunks->size() * 1024);
-
-                    bool transcription_failed = false;
-                    for (std::size_t chunk_index = 0; chunk_index < audio_chunks->size(); ++chunk_index) {
-                        set_step(
-                            StepId::fetch_source_subtitle,
-                            StepState::in_progress,
-                            format_transcription_batch_progress(chunk_index, audio_chunks->size()),
-                            fetch_step_batch_progress(chunk_index, audio_chunks->size()));
-
-                        const AudioChunk& chunk = (*audio_chunks)[chunk_index];
-                        const std::filesystem::path chunk_result_directory = transcription_chunk_result_directory(chunk_root, chunk.path);
-                        const TranscriptionOutcome transcription = context.transcriber.transcribe(
-                            configuration_,
-                            chunk.path,
-                            chunk_result_directory,
-                            configuration_.source_lang,
-                            cancel_);
-                        if (!transcription.success) {
-                            if (transcription.message == "已取消") {
-                                return cancel_step(StepId::fetch_source_subtitle);
-                            }
-                            context.fetch_failure_status = transcription.message;
-                            transcription_failed = true;
-                            break;
-                        }
-
-                        const TranscriptReadResult chunk_transcript = load_transcript_words(
-                            chunk_result_directory / std::string{chunk_transcript_filename});
-                        if (!chunk_transcript.success) {
-                            context.fetch_failure_status = chunk_transcript.message;
-                            transcription_failed = true;
-                            break;
-                        }
-
-                        for (const TranscriptWord& word : chunk_transcript.words) {
-                            merged_words.push_back({
-                                .word = word.word,
-                                .start_seconds = word.start_seconds + chunk.start_seconds,
-                                .end_seconds = word.end_seconds + chunk.start_seconds,
-                            });
-                        }
-                    }
-
-                    if (transcription_failed) {
-                        break;
-                    }
-
-                    set_step(
-                        StepId::fetch_source_subtitle,
-                        StepState::in_progress,
-                        format_transcription_batch_progress(audio_chunks->size(), audio_chunks->size()),
-                        0.95);
-                    if (!save_transcript_words(merged_words, working_directory_ / std::string{transcript_filename})) {
-                        context.fetch_failure_status = "无法写入transcript.json";
-                        break;
-                    }
-
-                    std::error_code cleanup_error;
-                    std::filesystem::remove_all(chunk_root, cleanup_error);
-                    refresh_working_directory_state(context);
+                        progress_callback);
                 }
+                set_transcription_runtime(transcription.runtime);
+                if (!transcription.success) {
+                    if (transcription.message == "已取消") {
+                        return cancel_step(StepId::fetch_source_subtitle);
+                    }
+                    context.fetch_failure_status = transcription.message;
+                    break;
+                }
+                if (is_canceled()) {
+                    return cancel_step(StepId::fetch_source_subtitle);
+                }
+                set_step(StepId::fetch_source_subtitle, StepState::in_progress, "提交转写结果", 0.91);
+                if (!save_transcript_words_atomic(
+                        transcription.words,
+                        working_directory_ / std::string{transcript_filename})) {
+                    context.fetch_failure_status = "无法写入transcript.json";
+                    break;
+                }
+                context.subtitle_status = transcription.message;
+                refresh_working_directory_state(context);
             }
             if (context.working_directory_state.transcript_path.has_value() && build_source_subtitle_from_transcript(context)) {
-                context.has_api_transcription = true;
-                context.subtitle_status = "API转写";
+                context.has_transcription = true;
+                if (context.subtitle_status.empty()) {
+                    context.subtitle_status = "转写";
+                }
             } else if (context.fetch_failure_status == "无可用字幕") {
                 context.fetch_failure_status = "transcript.json生成字幕失败";
             }
@@ -688,7 +634,7 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
         }
     }
 
-    if (!context.has_platform_manual_subtitle && !context.has_api_transcription && context.working_directory_state.automatic_subtitle_path.has_value()) {
+    if (!context.has_platform_manual_subtitle && !context.has_transcription && context.working_directory_state.automatic_subtitle_path.has_value()) {
         if (!promote_existing_subtitle(context, *context.working_directory_state.automatic_subtitle_path)) {
             return fail_source_pipeline("无法写入en.srt", "无可用字幕");
         }
@@ -696,22 +642,22 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
         context.subtitle_status = "平台自动字幕";
     }
 
-    if (!context.has_platform_manual_subtitle && !context.has_api_transcription && !context.has_platform_automatic_subtitle && context.working_directory_state.source_subtitle_path.has_value()) {
+    if (!context.has_platform_manual_subtitle && !context.has_transcription && !context.has_platform_automatic_subtitle && context.working_directory_state.source_subtitle_path.has_value()) {
         context.has_platform_manual_subtitle = true;
         context.subtitle_status = "复用现有字幕";
     }
 
-    if (!context.has_platform_manual_subtitle && !context.has_api_transcription && !context.has_platform_automatic_subtitle && context.fetch_failure_status == "无可用字幕") {
+    if (!context.has_platform_manual_subtitle && !context.has_transcription && !context.has_platform_automatic_subtitle && context.fetch_failure_status == "无可用字幕") {
         if (context.working_directory_state.transcript_path.has_value()) {
             context.fetch_failure_status = "transcript.json生成字幕失败";
         } else if (context.working_directory_state.audio_path.has_value() || !context.video_path.empty()) {
-            context.fetch_failure_status = "API转写失败";
+            context.fetch_failure_status = "语音转写失败";
         }
     }
 
     const SourceSubtitleSelection source_subtitle = select_source_subtitle(
         context.has_platform_manual_subtitle,
-        context.has_api_transcription,
+        context.has_transcription,
         context.has_platform_automatic_subtitle);
     switch (source_subtitle) {
     case SourceSubtitleSelection::platform_manual_subtitle:
@@ -719,8 +665,10 @@ Task::AttemptResult Task::acquire_source_subtitles(ExecutionContext& context) {
             context.subtitle_status = "平台人工字幕";
         }
         break;
-    case SourceSubtitleSelection::api_transcription:
-        context.subtitle_status = "API转写";
+    case SourceSubtitleSelection::transcription:
+        if (context.subtitle_status.empty()) {
+            context.subtitle_status = "转写";
+        }
         break;
     case SourceSubtitleSelection::platform_automatic_subtitle:
         context.subtitle_status = "平台自动字幕";
@@ -832,9 +780,7 @@ Task::AttemptResult Task::render_output_video(ExecutionContext& context) {
     return {};
 }
 
-Task::AttemptResult Task::run_once() {
-    ExecutionContext context;
-
+Task::AttemptResult Task::run_once(ExecutionContext& context) {
     if (AttemptResult result = prepare_execution_context(context); result.outcome != AttemptOutcome::success) {
         return result;
     }
@@ -868,9 +814,10 @@ void Task::join_worker() {
 void Task::run() {
     const int retry_count = std::max(configuration_.retry_count, 0);
     int retries_used = 0;
+    ExecutionContext context;
 
     for (;;) {
-        const AttemptResult attempt = run_once();
+        const AttemptResult attempt = run_once(context);
         switch (attempt.outcome) {
         case AttemptOutcome::success:
             running_.store(false, std::memory_order_release);

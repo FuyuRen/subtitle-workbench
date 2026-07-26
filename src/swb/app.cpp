@@ -1,6 +1,7 @@
 #include "swb/app.h"
 
 #include "swb/text.h"
+#include "swb/workspace.h"
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <memory>
 #include <numbers>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -28,7 +30,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 namespace {
 
 constexpr int dialog_width = 480;
-constexpr int dialog_height = 730;
+constexpr int dialog_height = 860;
 
 std::string browse_path(
     HWND owner_window,
@@ -164,6 +166,54 @@ bool input_text(const char* label, std::string& text, ImGuiInputTextFlags flags 
 
 bool button(const char* label) {
     return ImGui::Button(label, {ImGui::GetContentRegionAvail().x, 0.0f});
+}
+
+void help_marker(std::string_view text) {
+    ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+    ImGui::TextDisabled("(?)");
+    if (!ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        return;
+    }
+
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+    ImGui::TextUnformatted(text.data(), text.data() + text.size());
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+[[nodiscard]] std::string format_mebibytes(std::uint64_t bytes) {
+    std::ostringstream output;
+    output.setf(std::ios::fixed);
+    output.precision(1);
+    output << static_cast<double>(bytes) / (1024.0 * 1024.0) << " MiB";
+    return output.str();
+}
+
+[[nodiscard]] std::string_view availability_label(swb::ModelAvailability availability) noexcept {
+    switch (availability) {
+    case swb::ModelAvailability::missing:
+        return "未下载";
+    case swb::ModelAvailability::available:
+        return "可用";
+    case swb::ModelAvailability::corrupt:
+        return "已损坏";
+    }
+    return "未知";
+}
+
+[[nodiscard]] std::string runtime_backend_label(const swb::TranscriptionRuntime& runtime) {
+    switch (runtime.backend) {
+    case swb::ActualTranscriptionBackend::api:
+        return "API";
+    case swb::ActualTranscriptionBackend::gpu:
+        return runtime.backend_name.empty() ? "GPU" : "GPU：" + runtime.backend_name;
+    case swb::ActualTranscriptionBackend::cpu:
+        return "CPU";
+    case swb::ActualTranscriptionBackend::not_initialized:
+        break;
+    }
+    return "尚未初始化";
 }
 
 constexpr std::array hard_subtitle_font_presets{
@@ -677,9 +727,13 @@ App::App() {
 
     configuration_path_ = swb::default_config_path();
     configuration_ = swb::load_config(configuration_path_);
+    local_asr_gpu_devices_ = swb::enumerate_local_asr_gpu_devices();
+    refresh_model_statuses();
 }
 
 App::~App() {
+    cancel_model_download();
+    join_model_worker();
     taskbar_progress_.clear();
     completion_notifier_.shutdown();
 
@@ -694,6 +748,73 @@ App::~App() {
     }
     if (window_class_.lpszClassName) {
         UnregisterClassW(window_class_.lpszClassName, window_class_.hInstance);
+    }
+}
+
+void App::refresh_model_statuses() {
+    const std::filesystem::path directory = swb::resolve_model_directory(configuration_.local_asr_model_dir);
+    const swb::ModelStatus asr_status = swb::inspect_model(swb::default_local_asr_model(), directory);
+    const swb::ModelStatus vad_status = swb::inspect_model(swb::default_vad_model(), directory);
+    std::scoped_lock lock(model_mutex_);
+    asr_model_status_ = asr_status;
+    vad_model_status_ = vad_status;
+    model_status_dirty_ = false;
+}
+
+void App::start_model_download(const swb::ModelManifestEntry& entry, bool force) {
+    {
+        std::scoped_lock lock(model_mutex_);
+        if (model_operation_running_) {
+            return;
+        }
+    }
+    join_model_worker();
+
+    const swb::ModelManifestEntry manifest_entry = entry;
+    const std::filesystem::path directory = swb::resolve_model_directory(configuration_.local_asr_model_dir);
+    cancel_model_download_.store(false, std::memory_order_release);
+    {
+        std::scoped_lock lock(model_mutex_);
+        model_operation_running_ = true;
+        model_download_fraction_ = 0.0;
+        active_model_id_ = std::string{manifest_entry.id};
+        model_operation_message_ = "正在下载";
+    }
+
+    model_worker_ = std::thread([this, manifest_entry, directory, force] {
+        const swb::ModelDownloadResult result = swb::download_model(
+            manifest_entry,
+            directory,
+            force,
+            cancel_model_download_,
+            [this](const swb::ModelDownloadProgress& progress) {
+                const double fraction = progress.total_bytes == 0
+                    ? 0.0
+                    : static_cast<double>(progress.downloaded_bytes) / static_cast<double>(progress.total_bytes);
+                std::scoped_lock lock(model_mutex_);
+                model_download_fraction_ = std::clamp(fraction, 0.0, 1.0);
+            });
+        const swb::ModelStatus status = swb::inspect_model(manifest_entry, directory);
+        std::scoped_lock lock(model_mutex_);
+        if (manifest_entry.kind == swb::ManagedModelKind::speech_recognition) {
+            asr_model_status_ = status;
+        } else {
+            vad_model_status_ = status;
+        }
+        model_operation_message_ = result.message;
+        model_download_fraction_ = result.success ? 1.0 : model_download_fraction_;
+        model_operation_running_ = false;
+        model_status_dirty_ = false;
+    });
+}
+
+void App::cancel_model_download() noexcept {
+    cancel_model_download_.store(true, std::memory_order_release);
+}
+
+void App::join_model_worker() {
+    if (model_worker_.joinable()) {
+        model_worker_.join();
     }
 }
 
@@ -841,12 +962,39 @@ void App::build_ui() {
                 if (is_running) {
                     current_task_.cancel();
                 } else if (!source_text_.empty()) {
-                    is_output_name_pending_autofill_ = !reuse_working_directory_ && output_name_.empty();
-                    last_synchronized_title_.clear();
-                    current_task_.start(source_text_, configuration_, {
-                        .output_name = output_name_,
-                        .reuse_working_directory = reuse_working_directory_,
-                    });
+                    if (configuration_.transcription_backend == swb::TranscriptionBackend::local) {
+                        bool status_dirty = false;
+                        {
+                            std::scoped_lock lock(model_mutex_);
+                            status_dirty = model_status_dirty_;
+                        }
+                        if (status_dirty) {
+                            refresh_model_statuses();
+                        }
+                    }
+
+                    swb::ModelStatus asr_status;
+                    bool model_operation_running = false;
+                    {
+                        std::scoped_lock lock(model_mutex_);
+                        asr_status = asr_model_status_;
+                        model_operation_running = model_operation_running_;
+                    }
+                    if (configuration_.transcription_backend == swb::TranscriptionBackend::local
+                        && asr_status.availability != swb::ModelAvailability::available) {
+                        if (!model_operation_running) {
+                            start_model_download(
+                                swb::default_local_asr_model(),
+                                asr_status.availability == swb::ModelAvailability::corrupt);
+                        }
+                    } else {
+                        is_output_name_pending_autofill_ = !reuse_working_directory_ && output_name_.empty();
+                        last_synchronized_title_.clear();
+                        current_task_.start(source_text_, configuration_, {
+                            .output_name = output_name_,
+                            .reuse_working_directory = reuse_working_directory_,
+                        });
+                    }
                 }
             }
             ImGui::EndTable();
@@ -943,6 +1091,9 @@ void App::build_ui() {
         bool should_open_output_settings_popup = false;
 
         constexpr std::array row_labels{
+            std::string_view{"语音识别"},
+            std::string_view{"模型目录"},
+            std::string_view{"实际后端"},
             std::string_view{"Whisper Base URL"},
             std::string_view{"Whisper API Key"},
             std::string_view{"Whisper Model"},
@@ -967,11 +1118,14 @@ void App::build_ui() {
             ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, label_width);
             ImGui::TableSetupColumn("control", ImGuiTableColumnFlags_WidthStretch);
 
-            const auto begin_row = [&](std::string_view row_label) {
+            const auto begin_row = [&](std::string_view row_label, std::string_view help_text = {}) {
                 ImGui::TableNextRow(0, ImGui::GetFrameHeight());
                 ImGui::TableSetColumnIndex(0);
                 ImGui::AlignTextToFramePadding();
                 ImGui::TextUnformatted(row_label.data());
+                if (!help_text.empty()) {
+                    help_marker(help_text);
+                }
                 ImGui::TableSetColumnIndex(1);
                 ImGui::SetNextItemWidth(-FLT_MIN);
             };
@@ -983,9 +1137,250 @@ void App::build_ui() {
                 is_dirty |= input_text(identifier.c_str(), value, flags);
             };
 
-            row_input("Whisper Base URL", configuration_.whisper_base_url);
-            row_input("Whisper API Key", configuration_.whisper_api_key, ImGuiInputTextFlags_Password);
-            row_input("Whisper Model", configuration_.whisper_model);
+            begin_row("语音识别");
+            const char* backend_preview = configuration_.transcription_backend == swb::TranscriptionBackend::local
+                ? "本地whisper.cpp"
+                : "Whisper API";
+            if (ImGui::BeginCombo("##transcription_backend", backend_preview)) {
+                if (ImGui::Selectable(
+                        "本地whisper.cpp",
+                        configuration_.transcription_backend == swb::TranscriptionBackend::local)) {
+                    configuration_.transcription_backend = swb::TranscriptionBackend::local;
+                    is_dirty = true;
+                    swb::ModelStatus asr_status;
+                    bool model_running = false;
+                    {
+                        std::scoped_lock lock(model_mutex_);
+                        asr_status = asr_model_status_;
+                        model_running = model_operation_running_;
+                    }
+                    if (!model_running && asr_status.availability == swb::ModelAvailability::missing) {
+                        start_model_download(swb::default_local_asr_model(), false);
+                    }
+                }
+                if (ImGui::Selectable(
+                        "Whisper API",
+                        configuration_.transcription_backend == swb::TranscriptionBackend::api)) {
+                    configuration_.transcription_backend = swb::TranscriptionBackend::api;
+                    is_dirty = true;
+                }
+                ImGui::EndCombo();
+            }
+
+            if (configuration_.transcription_backend == swb::TranscriptionBackend::api) {
+                row_input("Whisper Base URL", configuration_.whisper_base_url);
+                row_input("Whisper API Key", configuration_.whisper_api_key, ImGuiInputTextFlags_Password);
+                row_input("Whisper Model", configuration_.whisper_model);
+            } else {
+                bool model_operation_for_controls = false;
+                {
+                    std::scoped_lock lock(model_mutex_);
+                    model_operation_for_controls = model_operation_running_;
+                }
+                begin_row("本地模型");
+                ImGui::TextUnformatted("Whisper base multilingual q5_1");
+
+                {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted("模型目录");
+                    help_marker(
+                        "保存本地语音识别使用的Whisper模型和VAD模型。\n"
+                        "留空时使用应用的默认位置，一般为%LOCALAPPDATA%\\SubtitleWorkbench\\models。\n"
+                        "选择其他目录可将模型保存在其他磁盘。");
+                    ImGui::TableSetColumnIndex(1);
+                    if (model_operation_for_controls) {
+                        ImGui::BeginDisabled();
+                    }
+                    const float browse_width = ImGui::CalcTextSize("浏览").x + style.FramePadding.x * 2;
+                    ImGui::SetNextItemWidth(-(browse_width + style.ItemSpacing.x));
+                    const bool directory_changed = input_text("##local_model_directory", configuration_.local_asr_model_dir);
+                    if (directory_changed) {
+                        is_dirty = true;
+                        std::scoped_lock lock(model_mutex_);
+                        model_status_dirty_ = true;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        refresh_model_statuses();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("浏览##modeldir", {browse_width, 0.0f})) {
+                        if (std::string folder = browse_directory(window_handle_, L"选择本地模型目录"); !folder.empty()) {
+                            configuration_.local_asr_model_dir = std::move(folder);
+                            is_dirty = true;
+                            refresh_model_statuses();
+                        }
+                    }
+                    if (model_operation_for_controls) {
+                        ImGui::EndDisabled();
+                    }
+                }
+
+                swb::ModelStatus asr_status;
+                swb::ModelStatus vad_status;
+                bool model_running = false;
+                double model_progress = 0.0;
+                std::string operation_message;
+                {
+                    std::scoped_lock lock(model_mutex_);
+                    asr_status = asr_model_status_;
+                    vad_status = vad_model_status_;
+                    model_running = model_operation_running_;
+                    model_progress = model_download_fraction_;
+                    operation_message = model_operation_message_;
+                }
+
+                begin_row("模型状态");
+                const std::string asr_size = format_mebibytes(
+                    asr_status.size == 0 ? swb::default_local_asr_model().file_size : asr_status.size);
+                ImGui::Text("%s，%s", availability_label(asr_status.availability).data(), asr_size.c_str());
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", swb::path_to_utf8(asr_status.path).c_str());
+                }
+
+                begin_row("模型路径");
+                const std::string asr_path = swb::path_to_utf8(asr_status.path);
+                ImGui::TextWrapped("%s", asr_path.c_str());
+
+                begin_row("模型操作");
+                if (model_running) {
+                    ImGui::ProgressBar(static_cast<float>(model_progress), {-78.0f, 0.0f});
+                    ImGui::SameLine();
+                    if (ImGui::Button("取消##model_download")) {
+                        cancel_model_download();
+                    }
+                } else {
+                    const char* download_label = asr_status.availability == swb::ModelAvailability::available
+                        ? "重新下载##asr"
+                        : "下载##asr";
+                    if (ImGui::Button(download_label)) {
+                        start_model_download(
+                            swb::default_local_asr_model(),
+                            asr_status.availability != swb::ModelAvailability::missing);
+                    }
+                    if (asr_status.availability != swb::ModelAvailability::missing) {
+                        ImGui::SameLine();
+                        if (ImGui::Button("删除##asr")) {
+                            pending_model_deletion_ = std::string{swb::default_local_asr_model().id};
+                            ImGui::OpenPopup("删除本地模型");
+                        }
+                    }
+                }
+                if (!operation_message.empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", operation_message.c_str());
+                }
+
+                begin_row(
+                    "计算方式",
+                    "自动：尝试所选GPU，初始化失败后改用CPU，适合日常使用。\n"
+                    "GPU优先：明确使用所选GPU，初始化失败后改用CPU并显示原因。\n"
+                    "仅CPU：直接使用CPU。");
+                const char* compute_preview = "自动";
+                if (configuration_.local_asr_compute == swb::LocalAsrCompute::gpu) {
+                    compute_preview = "GPU优先";
+                } else if (configuration_.local_asr_compute == swb::LocalAsrCompute::cpu) {
+                    compute_preview = "仅CPU";
+                }
+                if (ImGui::BeginCombo("##local_compute", compute_preview)) {
+                    constexpr std::array compute_options{
+                        std::pair{swb::LocalAsrCompute::automatic, "自动"},
+                        std::pair{swb::LocalAsrCompute::gpu, "GPU优先"},
+                        std::pair{swb::LocalAsrCompute::cpu, "仅CPU"},
+                    };
+                    for (const auto& [value, label] : compute_options) {
+                        if (ImGui::Selectable(label, configuration_.local_asr_compute == value)) {
+                            configuration_.local_asr_compute = value;
+                            is_dirty = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                if (configuration_.local_asr_compute != swb::LocalAsrCompute::cpu) {
+                    begin_row("GPU设备");
+                    const auto selected_device = std::ranges::find(
+                        local_asr_gpu_devices_,
+                        configuration_.local_asr_gpu_device,
+                        &swb::LocalAsrGpuDevice::index);
+                    std::string device_preview = "选择GPU设备";
+                    if (selected_device != local_asr_gpu_devices_.end()) {
+                        device_preview = std::to_string(selected_device->index) + " · " + selected_device->name;
+                    } else if (local_asr_gpu_devices_.empty()) {
+                        device_preview = "仅CPU可用";
+                    }
+
+                    ImGui::BeginDisabled(local_asr_gpu_devices_.empty());
+                    if (ImGui::BeginCombo("##local_gpu_device", device_preview.c_str())) {
+                        for (const swb::LocalAsrGpuDevice& device : local_asr_gpu_devices_) {
+                            const bool selected = device.index == configuration_.local_asr_gpu_device;
+                            const std::string label = std::to_string(device.index) + " · " + device.name;
+                            if (ImGui::Selectable(label.c_str(), selected)) {
+                                configuration_.local_asr_gpu_device = device.index;
+                                is_dirty = true;
+                            }
+                            if (selected) {
+                                ImGui::SetItemDefaultFocus();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::EndDisabled();
+                }
+
+                begin_row(
+                    "推理线程",
+                    "控制whisper.cpp在推理阶段使用的CPU线程数。\n"
+                    "推荐值为0，程序会按系统报告的逻辑处理器数量自动设置。\n"
+                    "需要给其他程序留出处理器资源时，可设为逻辑处理器数量的一半，最低为1。");
+                int threads = std::max(configuration_.local_asr_threads, 0);
+                if (ImGui::InputInt("##local_threads", &threads)) {
+                    configuration_.local_asr_threads = std::max(threads, 0);
+                    is_dirty = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("0为自动");
+
+                begin_row(
+                    "VAD",
+                    "VAD是语音活动检测，用于识别人声片段，让Whisper跳过静音和长停顿。\n"
+                    "访谈、会议等长音频适合启用，下载VAD模型后生效。");
+                bool use_vad = configuration_.local_asr_use_vad;
+                if (ImGui::Checkbox("启用##local_vad", &use_vad)) {
+                    configuration_.local_asr_use_vad = use_vad;
+                    is_dirty = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", availability_label(vad_status.availability).data());
+                if (!model_running) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(vad_status.availability == swb::ModelAvailability::available
+                            ? "重新下载##vad"
+                            : "下载##vad")) {
+                        start_model_download(
+                            swb::default_vad_model(),
+                            vad_status.availability != swb::ModelAvailability::missing);
+                    }
+                    if (vad_status.availability != swb::ModelAvailability::missing) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("删除##vad")) {
+                            pending_model_deletion_ = std::string{swb::default_vad_model().id};
+                            ImGui::OpenPopup("删除本地模型");
+                        }
+                    }
+                }
+
+                const swb::TranscriptionRuntime runtime = current_task_.transcription_runtime();
+                begin_row("实际后端");
+                const std::string runtime_label = runtime_backend_label(runtime);
+                ImGui::TextUnformatted(runtime_label.c_str());
+                if (!runtime.fallback_reason.empty()) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", runtime.fallback_reason.c_str());
+                }
+            }
+
             row_input("LLM Base URL", configuration_.language_model_base_url);
             row_input("LLM API Key", configuration_.language_model_api_key, ImGuiInputTextFlags_Password);
             row_input("LLM Model", configuration_.language_model_name);
@@ -1035,6 +1430,43 @@ void App::build_ui() {
             ImGui::EndTable();
         }
         ImGui::PopStyleVar();
+
+        if (ImGui::BeginPopupModal("删除本地模型", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const swb::ModelManifestEntry* entry = swb::find_model_manifest_entry(pending_model_deletion_);
+            ImGui::TextWrapped("只会删除模型清单管理的文件。删除后需要重新下载才能使用对应功能。");
+            if (entry != nullptr) {
+                ImGui::TextDisabled("%s", entry->display_name.data());
+            }
+            bool operation_running = false;
+            {
+                std::scoped_lock lock(model_mutex_);
+                operation_running = model_operation_running_;
+            }
+            if (is_running || operation_running || entry == nullptr) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Button("确认删除", {120.0f, 0.0f})) {
+                const swb::OperationStatus removal = swb::remove_managed_model(
+                    *entry,
+                    swb::resolve_model_directory(configuration_.local_asr_model_dir));
+                {
+                    std::scoped_lock lock(model_mutex_);
+                    model_operation_message_ = removal.message;
+                }
+                refresh_model_statuses();
+                pending_model_deletion_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            if (is_running || operation_running || entry == nullptr) {
+                ImGui::EndDisabled();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("取消", {120.0f, 0.0f})) {
+                pending_model_deletion_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
 
         if (should_open_output_settings_popup) {
             ImGui::OpenPopup("编码配置");

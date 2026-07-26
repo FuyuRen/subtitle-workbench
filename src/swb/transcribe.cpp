@@ -3,10 +3,15 @@
 #include "swb/file_io.h"
 #include "swb/json.h"
 #include "swb/text.h"
+#include "swb/win32_headers.h"
 #include "swb/workspace.h"
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <ranges>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -81,7 +86,7 @@ constexpr std::size_t error_excerpt_limit = 160;
     return message;
 }
 
-void report_progress(const WhisperTranscriber::ProgressCallback& on_progress, TranscriptionStage stage) {
+void report_progress(const WhisperApiTranscriber::ProgressCallback& on_progress, TranscriptionStage stage) {
     if (on_progress) {
         on_progress(stage);
     }
@@ -225,7 +230,14 @@ using JsonCursor = json::Cursor;
             }
         }
 
-        if (has_word && has_start && has_end && !word.word.empty() && word.end_seconds >= word.start_seconds) {
+        if (has_word
+            && has_start
+            && has_end
+            && !word.word.empty()
+            && std::isfinite(word.start_seconds)
+            && std::isfinite(word.end_seconds)
+            && word.start_seconds >= 0.0
+            && word.end_seconds >= word.start_seconds) {
             words.push_back(std::move(word));
         }
 
@@ -259,7 +271,14 @@ using JsonCursor = json::Cursor;
             escaped.append("\\t");
             break;
         default:
-            escaped.push_back(static_cast<char>(character));
+            if (character < 0x20u) {
+                constexpr std::string_view hex_digits = "0123456789abcdef";
+                escaped.append("\\u00");
+                escaped.push_back(hex_digits[(character >> 4u) & 0x0fu]);
+                escaped.push_back(hex_digits[character & 0x0fu]);
+            } else {
+                escaped.push_back(static_cast<char>(character));
+            }
             break;
         }
     }
@@ -268,7 +287,7 @@ using JsonCursor = json::Cursor;
 
 }
 
-WhisperTranscriber::WhisperTranscriber(Sender sender) : sender_(std::move(sender)) {}
+WhisperApiTranscriber::WhisperApiTranscriber(Sender sender) : sender_(std::move(sender)) {}
 
 std::string format_transcription_progress(TranscriptionStage stage) {
     switch (stage) {
@@ -288,7 +307,7 @@ std::string format_transcription_batch_progress(std::size_t chunk_position, std:
     return "API转写（" + std::to_string(chunk_position) + "/" + std::to_string(chunk_count) + "）";
 }
 
-TranscriptionOutcome WhisperTranscriber::transcribe(
+TranscriptionOutcome WhisperApiTranscriber::transcribe(
     const Config& configuration,
     const std::filesystem::path& audio_path,
     const std::filesystem::path& working_directory,
@@ -428,6 +447,7 @@ bool save_transcript_words(std::span<const TranscriptWord> words, const std::fil
         return false;
     }
 
+    output << std::setprecision(std::numeric_limits<double>::max_digits10);
     output << "{\"task\":\"transcribe\",\"words\":[";
     for (std::size_t index = 0; index < words.size(); ++index) {
         if (index > 0) {
@@ -439,6 +459,27 @@ bool save_transcript_words(std::span<const TranscriptWord> words, const std::fil
     }
     output << "]}";
     return static_cast<bool>(output);
+}
+
+bool save_transcript_words_atomic(
+    std::span<const TranscriptWord> words,
+    const std::filesystem::path& path) {
+    std::filesystem::path part_path = path;
+    part_path += L".part";
+    std::error_code error_code;
+    std::filesystem::remove(part_path, error_code);
+    if (!save_transcript_words(words, part_path)) {
+        std::filesystem::remove(part_path, error_code);
+        return false;
+    }
+    if (!MoveFileExW(
+            part_path.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(part_path, error_code);
+        return false;
+    }
+    return true;
 }
 
 }

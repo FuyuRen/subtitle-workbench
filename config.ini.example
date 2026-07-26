@@ -1,4 +1,11 @@
-# Fill in API settings before running network tasks.
+# Local speech recognition is the default. The model is downloaded from the settings page.
+transcription_backend=local
+local_asr_model=base-q5_1
+local_asr_model_dir=
+local_asr_compute=auto
+local_asr_gpu_device=0
+local_asr_threads=0
+local_asr_use_vad=1
 whisper_base_url=https://api.openai.com/v1/audio/transcriptions
 whisper_api_key=
 whisper_model=whisper-1

@@ -3,6 +3,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace swb {
 
@@ -25,7 +28,25 @@ struct HardSubtitleStyle {
     SubtitleColor preview_background_color{22, 24, 28, 255};
 };
 
+enum class TranscriptionBackend : int {
+    local,
+    api,
+};
+
+enum class LocalAsrCompute : int {
+    automatic,
+    gpu,
+    cpu,
+};
+
 struct Config {
+    TranscriptionBackend transcription_backend{TranscriptionBackend::local};
+    std::string local_asr_model{"base-q5_1"};
+    std::string local_asr_model_dir;
+    LocalAsrCompute local_asr_compute{LocalAsrCompute::automatic};
+    int local_asr_gpu_device{0};
+    int local_asr_threads{0};
+    bool local_asr_use_vad{true};
     std::string whisper_base_url;
     std::string whisper_api_key;
     std::string whisper_model{"whisper-1"};
@@ -38,7 +59,12 @@ struct Config {
     std::string output_dir;
     bool bilingual_subtitles{false};
     HardSubtitleStyle hard_subtitle_style{};
+    std::vector<std::pair<std::string, std::string>> preserved_fields;
 };
+
+[[nodiscard]] std::string_view transcription_backend_name(TranscriptionBackend backend) noexcept;
+
+[[nodiscard]] std::string_view local_asr_compute_name(LocalAsrCompute compute) noexcept;
 
 [[nodiscard]] std::filesystem::path default_config_path();
 

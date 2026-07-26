@@ -25,3 +25,10 @@ NOTES.md
 /imgui.ini
 Thumbs.db
 Desktop.ini
+
+# Local speech-recognition models and incomplete downloads
+/models/
+/test-models/
+ggml-base-q5_1.bin
+ggml-silero-v6.2.0.bin
+*.bin.part

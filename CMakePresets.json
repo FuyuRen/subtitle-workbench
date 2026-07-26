@@ -7,7 +7,9 @@
             "binaryDir": "${sourceDir}/build/debug",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_CXX_COMPILER": "cl"
+                "CMAKE_CXX_COMPILER": "cl",
+                "SWB_WHISPER_VULKAN": "OFF",
+                "SWB_WHISPER_CUDA": "OFF"
             }
         },
         {
@@ -16,7 +18,9 @@
             "binaryDir": "${sourceDir}/build/release",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_CXX_COMPILER": "cl"
+                "CMAKE_CXX_COMPILER": "cl",
+                "SWB_WHISPER_VULKAN": "ON",
+                "SWB_WHISPER_CUDA": "OFF"
             }
         }
     ],

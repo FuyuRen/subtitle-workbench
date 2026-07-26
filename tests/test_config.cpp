@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 
 using swb::test::expect_eq;
 using swb::test::expect_true;
@@ -31,6 +32,10 @@ const swb::test::Registrar case_1{
         expect_eq(configuration.source_lang, std::string{"en"});
         expect_eq(configuration.target_lang, std::string{"zh"});
         expect_eq(configuration.retry_count, 0);
+        expect_true(configuration.transcription_backend == swb::TranscriptionBackend::local);
+        expect_eq(configuration.local_asr_model, std::string{"base-q5_1"});
+        expect_true(configuration.local_asr_compute == swb::LocalAsrCompute::automatic);
+        expect_true(configuration.local_asr_use_vad);
         expect_true(!configuration.bilingual_subtitles);
         expect_eq(configuration.hard_subtitle_style.font_name, std::string{"Microsoft YaHei"});
         expect_eq(configuration.hard_subtitle_style.chinese_font_size, 28);
@@ -48,6 +53,12 @@ const swb::test::Registrar case_2{
     "config: round trip preserves all fields",
     [] {
         swb::Config original;
+        original.transcription_backend = swb::TranscriptionBackend::api;
+        original.local_asr_model_dir = "custom-models";
+        original.local_asr_compute = swb::LocalAsrCompute::gpu;
+        original.local_asr_gpu_device = 2;
+        original.local_asr_threads = 6;
+        original.local_asr_use_vad = false;
         original.whisper_base_url = "https://api.openai.com/v1";
         original.whisper_api_key = "sk-w";
         original.whisper_model = "gpt-4o-mini-transcribe";
@@ -72,6 +83,12 @@ const swb::test::Registrar case_2{
         swb::save_config(original, path);
 
         const auto loaded_configuration = swb::load_config(path);
+        expect_true(loaded_configuration.transcription_backend == original.transcription_backend);
+        expect_eq(loaded_configuration.local_asr_model_dir, original.local_asr_model_dir);
+        expect_true(loaded_configuration.local_asr_compute == original.local_asr_compute);
+        expect_eq(loaded_configuration.local_asr_gpu_device, original.local_asr_gpu_device);
+        expect_eq(loaded_configuration.local_asr_threads, original.local_asr_threads);
+        expect_true(loaded_configuration.local_asr_use_vad == original.local_asr_use_vad);
         expect_eq(loaded_configuration.whisper_base_url, original.whisper_base_url);
         expect_eq(loaded_configuration.whisper_api_key, original.whisper_api_key);
         expect_eq(loaded_configuration.whisper_model, original.whisper_model);
@@ -146,6 +163,58 @@ const swb::test::Registrar case_5{
         std::filesystem::remove(path);
         const auto configuration = swb::load_config(path);
         expect_eq(configuration.whisper_model, std::string{"whisper-1"});
+    },
+};
+
+const swb::test::Registrar case_6{
+    "config: legacy explicit api settings migrate to api backend",
+    [] {
+        const auto path = temp_config_path("legacy-api-migration");
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output << "whisper_base_url=https://provider.example/v1\n"
+                   << "whisper_api_key=legacy-secret\n"
+                   << "whisper_model=whisper-1\n";
+        }
+
+        const swb::Config configuration = swb::load_config(path);
+        expect_true(configuration.transcription_backend == swb::TranscriptionBackend::api);
+        expect_eq(configuration.whisper_api_key, std::string{"legacy-secret"});
+    },
+};
+
+const swb::test::Registrar case_7{
+    "config: explicit local backend overrides legacy api settings",
+    [] {
+        const auto path = temp_config_path("explicit-local-migration");
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output << "transcription_backend=local\n"
+                   << "whisper_api_key=preserved-secret\n"
+                   << "local_asr_compute=cpu\n";
+        }
+
+        const swb::Config configuration = swb::load_config(path);
+        expect_true(configuration.transcription_backend == swb::TranscriptionBackend::local);
+        expect_true(configuration.local_asr_compute == swb::LocalAsrCompute::cpu);
+        expect_eq(configuration.whisper_api_key, std::string{"preserved-secret"});
+    },
+};
+
+const swb::test::Registrar case_8{
+    "config: save preserves unknown fields",
+    [] {
+        const auto path = temp_config_path("preserve-unknown");
+        {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output << "future_setting=kept\n";
+        }
+
+        swb::Config configuration = swb::load_config(path);
+        swb::save_config(configuration, path);
+        std::ifstream input(path, std::ios::binary);
+        const std::string saved{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+        expect_true(saved.find("future_setting=kept") != std::string::npos);
     },
 };
 

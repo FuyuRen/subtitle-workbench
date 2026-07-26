@@ -1,6 +1,7 @@
 #pragma once
 
 #include "swb/config.h"
+#include "swb/transcribe.h"
 
 #include <array>
 #include <atomic>
@@ -84,6 +85,7 @@ public:
     [[nodiscard]] Snapshot read() const;
     [[nodiscard]] std::string detected_title() const;
     [[nodiscard]] std::filesystem::path working_directory() const;
+    [[nodiscard]] TranscriptionRuntime transcription_runtime() const;
 
 private:
     struct ExecutionContext;
@@ -108,6 +110,7 @@ private:
 
     void run();
     void set_detected_title(std::string detected_title);
+    void set_transcription_runtime(TranscriptionRuntime runtime);
     [[nodiscard]] bool is_canceled() const noexcept;
     [[nodiscard]] AttemptResult fail_step(StepId step, std::string status) const;
     [[nodiscard]] AttemptResult cancel_step(StepId step) const;
@@ -119,7 +122,7 @@ private:
     [[nodiscard]] AttemptResult acquire_source_subtitles(ExecutionContext& context);
     [[nodiscard]] AttemptResult translate_source_subtitles(ExecutionContext& context);
     [[nodiscard]] AttemptResult render_output_video(ExecutionContext& context);
-    [[nodiscard]] AttemptResult run_once();
+    [[nodiscard]] AttemptResult run_once(ExecutionContext& context);
     void reset_steps();
     void set_step(StepId step, StepState state, std::string status, std::optional<double> progress = std::nullopt);
     void apply_attempt_failure(const AttemptFailure& failure);
@@ -138,6 +141,7 @@ private:
     bool reuse_working_directory_{false};
     std::string detected_title_;
     std::filesystem::path working_directory_;
+    TranscriptionRuntime transcription_runtime_;
 };
 
 }
