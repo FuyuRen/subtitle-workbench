@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -23,6 +24,17 @@ namespace {
 constexpr int local_window_seconds = 30;
 constexpr int api_window_seconds = 300;
 constexpr int window_overlap_seconds = 2;
+constexpr double centiseconds_per_second = 100.0;
+
+struct SampleRange {
+    std::size_t begin{0};
+    std::size_t end{0};
+};
+
+struct VadSpeechSelection {
+    bool success{false};
+    std::optional<SampleRange> range;
+};
 
 struct ModelFileLoader {
     std::ifstream input;
@@ -171,6 +183,63 @@ void report_inference_progress(whisper_context*, whisper_state*, int progress, v
     return static_cast<int>(std::max(1u, hardware_threads == 0 ? 4u : hardware_threads));
 }
 
+[[nodiscard]] VadSpeechSelection select_vad_speech_range(
+    whisper_vad_context* context,
+    std::span<const float> samples) {
+    whisper_vad_params parameters = whisper_vad_default_params();
+    std::unique_ptr<whisper_vad_segments, decltype(&whisper_vad_free_segments)> segments{
+        whisper_vad_segments_from_samples(
+            context,
+            parameters,
+            samples.data(),
+            static_cast<int>(samples.size())),
+        whisper_vad_free_segments,
+    };
+    if (!segments) {
+        return {};
+    }
+
+    const int segment_count = whisper_vad_segments_n_segments(segments.get());
+    if (segment_count == 0) {
+        return {.success = true};
+    }
+
+    std::size_t first_sample = samples.size();
+    std::size_t last_sample = 0;
+    for (int index = 0; index < segment_count; ++index) {
+        const double start_centiseconds = whisper_vad_segments_get_segment_t0(segments.get(), index);
+        const double end_centiseconds = whisper_vad_segments_get_segment_t1(segments.get(), index);
+        if (!std::isfinite(start_centiseconds)
+            || !std::isfinite(end_centiseconds)
+            || end_centiseconds <= start_centiseconds) {
+            continue;
+        }
+
+        const auto to_sample = [&](double centiseconds) {
+            const std::int64_t sample = std::llround(
+                centiseconds * static_cast<double>(WHISPER_SAMPLE_RATE) / centiseconds_per_second);
+            return static_cast<std::size_t>(std::clamp<std::int64_t>(
+                sample,
+                0,
+                static_cast<std::int64_t>(samples.size())));
+        };
+        const std::size_t begin = to_sample(start_centiseconds);
+        const std::size_t end = to_sample(end_centiseconds);
+        if (end <= begin) {
+            continue;
+        }
+        first_sample = std::min(first_sample, begin);
+        last_sample = std::max(last_sample, end);
+    }
+    if (last_sample <= first_sample) {
+        return {};
+    }
+    return {
+        .success = true,
+        .range = SampleRange{.begin = first_sample, .end = last_sample},
+    };
+}
+
 [[nodiscard]] std::vector<TranscriptToken> read_context_tokens(whisper_context* context) {
     std::vector<TranscriptToken> tokens;
     const whisper_token first_control_token = whisper_token_eot(context);
@@ -283,8 +352,8 @@ WhisperCppContextSelection select_whisper_cpp_context(
 
 struct WhisperCppTranscriber::Implementation {
     std::filesystem::path model_path;
-    std::filesystem::path vad_model_path;
     WhisperCppContextSelection context;
+    std::unique_ptr<whisper_vad_context, decltype(&whisper_vad_free)> vad_context{nullptr, whisper_vad_free};
     std::string initialization_error;
     std::vector<std::string> initialization_diagnostics;
 };
@@ -313,7 +382,16 @@ WhisperCppTranscriber::WhisperCppTranscriber(
     if (configuration.local_asr_use_vad) {
         const ModelStatus vad_status = inspect_model(default_vad_model(), model_directory);
         if (vad_status.availability == ModelAvailability::available) {
-            implementation_->vad_model_path = vad_status.path;
+            whisper_vad_context_params vad_parameters = whisper_vad_default_context_params();
+            vad_parameters.n_threads = configured_thread_count(configuration.local_asr_threads);
+            const std::string vad_model_path = path_to_utf8(vad_status.path);
+            whisper_vad_context* raw_vad_context =
+                whisper_vad_init_from_file_with_params(vad_model_path.c_str(), vad_parameters);
+            if (raw_vad_context != nullptr) {
+                implementation_->vad_context.reset(raw_vad_context);
+            } else {
+                implementation_->initialization_diagnostics.emplace_back("VAD模型初始化失败，本次转写使用完整音频窗口");
+            }
         } else {
             implementation_->initialization_diagnostics.emplace_back("VAD模型不可用，本次转写不启用VAD");
         }
@@ -384,9 +462,10 @@ TranscriptionResult WhisperCppTranscriber::transcribe_wav(
 
     result.diagnostics = implementation_->initialization_diagnostics;
     whisper_context* context = static_cast<whisper_context*>(implementation_->context.context.get());
+    whisper_vad_context* vad_context = implementation_->vad_context.get();
     const std::string language = source_language.empty() ? std::string{"auto"} : std::string{source_language};
-    const std::string vad_model_path = path_to_utf8(implementation_->vad_model_path);
     double last_progress = 0.0;
+    bool vad_detection_failure_reported = false;
     while (const std::optional<AudioWindow> window = reader.read_next(local_window_seconds, window_overlap_seconds)) {
         if (cancel.load(std::memory_order_acquire)) {
             result.message = "已取消";
@@ -395,11 +474,36 @@ TranscriptionResult WhisperCppTranscriber::transcribe_wav(
         }
 
         std::vector<float> samples = pcm16_to_float(window->samples);
+        std::span<const float> inference_samples{samples};
+        double inference_offset_seconds = 0.0;
+        if (vad_context != nullptr) {
+            const VadSpeechSelection selection = select_vad_speech_range(vad_context, samples);
+            if (!selection.success) {
+                if (!vad_detection_failure_reported) {
+                    result.diagnostics.emplace_back("VAD检测失败，本次转写使用完整音频窗口");
+                    vad_detection_failure_reported = true;
+                }
+            } else if (!selection.range.has_value()) {
+                report_progress(
+                    on_progress,
+                    "本地转写",
+                    (window->start_seconds + window->duration_seconds) / audio_duration,
+                    last_progress);
+                continue;
+            } else {
+                const SampleRange range = *selection.range;
+                inference_samples = inference_samples.subspan(range.begin, range.end - range.begin);
+                inference_offset_seconds = static_cast<double>(range.begin) / WHISPER_SAMPLE_RATE;
+            }
+        }
+        const double inference_duration_seconds =
+            static_cast<double>(inference_samples.size()) / WHISPER_SAMPLE_RATE;
+        const double inference_start_seconds = window->start_seconds + inference_offset_seconds;
         InferenceCallbacks callbacks{
             .cancel = &cancel,
             .on_progress = &on_progress,
-            .window_start_seconds = window->start_seconds,
-            .window_duration_seconds = window->duration_seconds,
+            .window_start_seconds = inference_start_seconds,
+            .window_duration_seconds = inference_duration_seconds,
             .audio_duration_seconds = audio_duration,
             .last_progress = &last_progress,
         };
@@ -419,14 +523,14 @@ TranscriptionResult WhisperCppTranscriber::transcribe_wav(
         parameters.progress_callback_user_data = &callbacks;
         parameters.abort_callback = abort_inference;
         parameters.abort_callback_user_data = &callbacks;
-        parameters.vad = !vad_model_path.empty();
-        parameters.vad_model_path = vad_model_path.empty() ? nullptr : vad_model_path.c_str();
+        parameters.vad = false;
+        parameters.vad_model_path = nullptr;
 
         const int inference_status = whisper_full(
             context,
             parameters,
-            samples.data(),
-            static_cast<int>(samples.size()));
+            inference_samples.data(),
+            static_cast<int>(inference_samples.size()));
         samples.clear();
         samples.shrink_to_fit();
         if (cancel.load(std::memory_order_acquire)) {
@@ -450,16 +554,21 @@ TranscriptionResult WhisperCppTranscriber::transcribe_wav(
         }
         const std::string_view aggregation_language = detected_language.empty() ? source_language : detected_language;
         TokenAggregationResult window_result =
-            aggregate_transcript_tokens(tokens, aggregation_language, window->duration_seconds);
+            aggregate_transcript_tokens(tokens, aggregation_language, inference_duration_seconds);
         for (TranscriptWord& word : window_result.words) {
-            word.start_seconds += window->start_seconds;
-            word.end_seconds += window->start_seconds;
+            word.start_seconds += inference_start_seconds;
+            word.end_seconds += inference_start_seconds;
         }
         result.words = merge_overlapping_transcript_words(result.words, window_result.words, window->start_seconds);
         result.diagnostics.insert(
             result.diagnostics.end(),
             std::make_move_iterator(window_result.diagnostics.begin()),
             std::make_move_iterator(window_result.diagnostics.end()));
+        report_progress(
+            on_progress,
+            "本地转写",
+            (window->start_seconds + window->duration_seconds) / audio_duration,
+            last_progress);
     }
     if (!reader.error().empty()) {
         result.message = reader.error();

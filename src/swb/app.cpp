@@ -1344,7 +1344,7 @@ void App::build_ui() {
 
                 begin_row(
                     "VAD",
-                    "VAD是语音活动检测，用于识别人声片段，让Whisper跳过静音和长停顿。\n"
+                    "VAD是语音活动检测，用于定位人声范围，减少静音片段参与Whisper识别。\n"
                     "访谈、会议等长音频适合启用，下载VAD模型后生效。");
                 bool use_vad = configuration_.local_asr_use_vad;
                 if (ImGui::Checkbox("启用##local_vad", &use_vad)) {

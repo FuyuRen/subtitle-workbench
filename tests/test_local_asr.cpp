@@ -200,7 +200,7 @@ const swb::test::Registrar case_7{
     [] {
         const std::vector<swb::TranscriptWord> existing{
             {.word = "before", .start_seconds = 25.0, .end_seconds = 26.0},
-            {.word = "Hello", .start_seconds = 27.0, .end_seconds = 27.5},
+            {.word = "Hello,", .start_seconds = 27.0, .end_seconds = 27.5},
             {.word = "there", .start_seconds = 28.0, .end_seconds = 28.4},
         };
         const std::vector<swb::TranscriptWord> incoming{
@@ -213,13 +213,14 @@ const swb::test::Registrar case_7{
             swb::merge_overlapping_transcript_words(existing, incoming, 27.0);
         expect_eq(merged.size(), std::size_t{5});
         expect_eq(merged[0].word, std::string{"before"});
-        expect_eq(merged[1].word, std::string{"Hello"});
+        expect_eq(merged[1].word, std::string{"Hello,"});
         expect_eq(merged[2].word, std::string{"again"});
         expect_eq(merged[4].word, std::string{"world"});
         double previous_start = 0.0;
         double previous_end = 0.0;
         for (const swb::TranscriptWord& word : merged) {
             expect_true(word.start_seconds >= previous_start);
+            expect_true(word.start_seconds >= previous_end);
             expect_true(word.end_seconds >= previous_end);
             previous_start = word.start_seconds;
             previous_end = word.end_seconds;
@@ -366,6 +367,48 @@ const swb::test::Registrar case_12{
             cancel);
         expect_true(!unsupported.success);
         expect_true(unsupported.message.find("不支持源语言") != std::string::npos);
+    },
+};
+
+const swb::test::Registrar case_13{
+    "local asr: vad preserves leading silence on the original timeline",
+    [] {
+        const char* model_directory = std::getenv("SWB_LOCAL_ASR_MODEL_DIR");
+        const char* english_audio = std::getenv("SWB_LOCAL_ASR_EN_WAV");
+        if (model_directory == nullptr || english_audio == nullptr) {
+            return;
+        }
+
+        swb::WavWindowReader source_reader{std::filesystem::u8path(english_audio)};
+        expect_true(source_reader.valid());
+        const std::optional<swb::AudioWindow> source = source_reader.read_next(20, 0);
+        expect_true(source.has_value());
+        if (!source.has_value()) {
+            return;
+        }
+
+        constexpr std::size_t leading_silence_samples = 5u * 16'000u;
+        std::vector<std::int16_t> padded_samples(leading_silence_samples, 0);
+        padded_samples.insert(padded_samples.end(), source->samples.begin(), source->samples.end());
+        const std::filesystem::path directory = make_temp_directory("local-asr-vad-timeline");
+        const std::filesystem::path padded_audio = directory / "padded.wav";
+        expect_true(swb::write_pcm16_wav(padded_audio, padded_samples));
+
+        swb::Config configuration;
+        configuration.local_asr_model_dir = model_directory;
+        configuration.local_asr_compute = swb::LocalAsrCompute::cpu;
+        configuration.local_asr_use_vad = true;
+        std::atomic<bool> cancel{false};
+        swb::WhisperCppTranscriber transcriber{configuration};
+        expect_true(transcriber.ready());
+        const swb::TranscriptionResult result = transcriber.transcribe_wav(
+            configuration,
+            padded_audio,
+            "en",
+            cancel);
+
+        expect_valid_words(result);
+        expect_true(result.words.front().start_seconds >= 4.0);
     },
 };
 

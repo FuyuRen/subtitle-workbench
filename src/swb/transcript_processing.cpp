@@ -96,22 +96,31 @@ namespace {
     });
 }
 
-[[nodiscard]] std::string normalize_word_for_deduplication(std::string_view word) {
+[[nodiscard]] std::vector<std::uint32_t> normalize_word_for_deduplication(std::string_view word) {
     const std::string_view trimmed = trim_ascii_whitespace(word);
-    std::string normalized;
-    normalized.reserve(trimmed.size());
-    for (const unsigned char character : trimmed) {
-        if (character >= 'A' && character <= 'Z') {
-            normalized.push_back(static_cast<char>(character - 'A' + 'a'));
-        } else {
-            normalized.push_back(static_cast<char>(character));
+    const std::optional<std::vector<std::uint32_t>> decoded = decode_utf8(trimmed);
+    if (!decoded.has_value()) {
+        return {};
+    }
+
+    std::vector<std::uint32_t> normalized;
+    normalized.reserve(decoded->size());
+    for (std::uint32_t code_point : *decoded) {
+        if (code_point == ' ' || code_point == '\t' || is_unicode_punctuation(code_point)) {
+            continue;
         }
+        if (code_point >= 'A' && code_point <= 'Z') {
+            code_point = code_point - 'A' + 'a';
+        }
+        normalized.push_back(code_point);
     }
     return normalized;
 }
 
 [[nodiscard]] bool duplicate_words(const TranscriptWord& left, const TranscriptWord& right) {
-    if (normalize_word_for_deduplication(left.word) != normalize_word_for_deduplication(right.word)) {
+    const std::vector<std::uint32_t> normalized_left = normalize_word_for_deduplication(left.word);
+    const std::vector<std::uint32_t> normalized_right = normalize_word_for_deduplication(right.word);
+    if (normalized_left.empty() || normalized_left != normalized_right) {
         return false;
     }
     const double overlap = std::min(left.end_seconds, right.end_seconds) - std::max(left.start_seconds, right.start_seconds);
@@ -285,7 +294,8 @@ std::vector<TranscriptWord> merge_overlapping_transcript_words(
     std::ranges::stable_sort(merged, {}, &TranscriptWord::start_seconds);
     double previous_end = 0.0;
     for (TranscriptWord& word : merged) {
-        word.end_seconds = std::max({word.end_seconds, word.start_seconds, previous_end});
+        word.start_seconds = std::max(word.start_seconds, previous_end);
+        word.end_seconds = std::max(word.end_seconds, word.start_seconds);
         previous_end = word.end_seconds;
     }
     return merged;
